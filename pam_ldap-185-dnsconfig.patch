@@ -1,0 +1,337 @@
+--- pam_ldap-176/Makefile.am	2004-09-30 22:33:14.000000000 -0400
++++ pam_ldap-176/Makefile.am	2004-10-28 17:24:13.691936696 -0400
+@@ -2,7 +2,7 @@ noinst_PROGRAMS = pam_ldap.so
+ EXTRA_DIST = COPYING.LIB CVSVersionInfo.txt ChangeLog README \
+ 	     ldap.conf pam.conf pam_ldap.spec pam.d
+ 
+-pam_ldap_so_SOURCES = pam_ldap.c pam_ldap.h md5.c md5.h vers.c
++pam_ldap_so_SOURCES = pam_ldap.c pam_ldap.h md5.c md5.h vers.c resolve.c resolve.h dnsconfig.c dnsconfig.h snprintf.c snprintf.h
+ pam_ldap_so_LDFLAGS = @pam_ldap_so_LDFLAGS@
+ 
+ man_MANS = pam_ldap.5
+--- pam_ldap-176/configure.in	2004-09-30 22:33:14.000000000 -0400
++++ pam_ldap-176/configure.in	2004-10-28 17:24:13.692936544 -0400
+@@ -133,6 +133,38 @@
+ AC_CHECK_FUNCS(ldap_initialize)
+ AC_CHECK_FUNCS(ldap_sasl_bind ldap_sasl_interactive_bind_s)
+ AC_CHECK_FUNCS(gethostbyname_r)
++AC_CHECK_FUNCS(snprintf strtok_r)
++AC_CHECK_LIB(resolv, main)
++AC_CHECK_HEADERS(resolv.h)
++AC_CHECK_FUNCS(res_search dn_expand)
++if test x$ac_cv_func_res_search = xno ; then
++	AC_MSG_CHECKING([for res_search again])
++	AC_TRY_LINK([#ifdef HAVE_RESOLV_H
++		     #include <resolv.h>
++		     #endif
++		     #ifdef HAVE_STDLIB_H
++		     #include <stdlib.h>
++		     #endif],
++		    [res_search(NULL,0,0,NULL,0);],
++		    AC_DEFINE(HAVE_RES_SEARCH,1,
++		    	      [Define if you have res_search().])
++		    ac_cv_func_res_search=yes)
++	AC_CHECK_FUNCS(res_search)
++fi
++if test x$ac_cv_func_dn_expand = xno ; then
++	AC_MSG_CHECKING([for dn_expand again])
++	AC_TRY_LINK([#ifdef HAVE_RESOLV_H
++		     #include <resolv.h>
++		     #endif
++		     #ifdef HAVE_STDLIB_H
++		     #include <stdlib.h>
++		     #endif],
++		    [dn_expand(NULL,NULL,NULL,NULL,0);],
++		    AC_DEFINE(HAVE_DN_EXPAND,1,
++		    	      [Define if you have dn_expand().])
++		    ac_cv_func_dn_expand=yes)
++	AC_CHECK_FUNCS(dn_expand)
++fi
+ 
+ if test "$ac_cv_func_gethostbyname_r" = "yes"; then
+ AC_CACHE_CHECK(whether gethostbyname_r takes 6 arguments, xad_cv_gethostbyname_r_args, [
+--- /dev/null	2004-10-19 17:45:17.794252000 -0400
++++ pam_ldap-176/dnsconfig.c	2004-10-28 17:32:36.915435096 -0400
+@@ -0,0 +1,214 @@
++
++/* Copyright (C) 1997-2001 Luke Howard.
++   This file started off as part of the nss_ldap library.
++   Contributed by Luke Howard, <lukeh@padl.com>, 1997.
++   (The author maintains a non-exclusive licence to distribute this file
++   under their own conditions.)
++
++   The nss_ldap library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Library General Public License as
++   published by the Free Software Foundation; either version 2 of the
++   License, or (at your option) any later version.
++
++   The nss_ldap library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Library General Public License for more details.
++
++   You should have received a copy of the GNU Library General Public
++   License along with the nss_ldap library; see the file COPYING.LIB.  If not,
++   write to the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++   Boston, MA 02111-1307, USA.
++ */
++
++/*
++ * Support DNS SRV records. I look up the SRV record for
++ * _ldap._tcp.gnu.org.
++ * and build the DN DC=gnu,DC=org.
++ * Thanks to Assar & co for resolve.[ch].
++ */
++
++static char rcsId[] = "$Id: dnsconfig.c,v 2.24 2001/02/27 14:44:31 lukeh Exp $";
++
++#include "config.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <sys/param.h>
++#include <netdb.h>
++#include <syslog.h>
++#include <netinet/in.h>
++#include <arpa/nameser.h>
++#include <resolv.h>
++#include <string.h>
++
++#ifdef HAVE_LBER_H
++#include <lber.h>
++#endif
++#ifdef HAVE_LDAP_H
++#include <ldap.h>
++#endif
++
++#ifndef HAVE_SNPRINTF
++#include "snprintf.h"
++#endif
++
++#include "pam_ldap.h"
++#include "resolve.h"
++#include "dnsconfig.h"
++
++#define DC_ATTR "DC"
++#define DC_ATTR_AVA DC_ATTR "="
++#define DC_ATTR_AVA_LEN (sizeof(DC_ATTR_AVA) - 1)
++
++/* map gnu.org into DC=gnu,DC=org */
++int
++_pam_ldap_getdnsdn (char *src_domain, char **rval)
++{
++  char *p;
++  int len = 0;
++#ifdef HAVE_STRTOK_R
++  char *st = NULL;
++#endif
++  char *domain;
++  char domain_copy[BUFSIZ], buffer[BUFSIZ];
++
++  /* we need to take a copy of domain, because strtok() modifies
++   * it in place. Bad.
++   */
++  if (strlen (src_domain) >= sizeof (domain_copy))
++    {
++      return PAM_SYSTEM_ERR;
++    }
++  memset (domain_copy, '\0', sizeof (domain_copy));
++  memset (buffer, '\0', sizeof (buffer));
++  strcpy (domain_copy, src_domain);
++
++  domain = domain_copy;
++
++#ifndef HAVE_STRTOK_R
++  while ((p = strtok (domain, ".")))
++#else
++  while ((p = strtok_r (domain, ".", &st)))
++#endif
++    {
++      len = strlen (p);
++
++      if (strlen (buffer) + DC_ATTR_AVA_LEN + len + 1 >= sizeof (buffer))
++	{
++	  return PAM_SYSTEM_ERR;
++	}
++
++      if (domain == NULL)
++	{
++	  strcat (buffer, ",");
++	}
++      else
++	{
++	  domain = NULL;
++	}
++
++      strcat (buffer, DC_ATTR_AVA);
++      strcat (buffer, p);
++    }
++
++  if (rval != NULL)
++    {
++      *rval = strdup (buffer);
++    }
++
++  return PAM_SUCCESS;
++}
++
++
++int
++_pam_ldap_readconfigfromdns (pam_ldap_config_t * result)
++{
++  int stat = PAM_SUCCESS;
++  struct dns_reply *r;
++  struct resource_record *rr;
++  char domain[MAXHOSTNAMELEN + 1];
++
++  /* only reinitialize variables we'll change here */
++  result->host = NULL;
++  result->base = NULL;
++  result->port = LDAP_PORT;
++#ifdef LDAP_VERSION3
++  result->version = LDAP_VERSION3;
++#else
++  result->version = LDAP_VERSION2;
++#endif /* LDAP_VERSION3 */
++
++  if ((_res.options & RES_INIT) == 0 && res_init () == -1)
++    {
++      return PAM_SYSTEM_ERR;
++    }
++
++  snprintf (domain, sizeof (domain), "_ldap._tcp.%s.", _res.defdname);
++
++  r = dns_lookup (domain, "srv");
++  if (r == NULL)
++    {
++      return PAM_SYSTEM_ERR;
++    }
++
++  /* XXX need to sort by priority and reorder using weights */
++  for (rr = r->head; rr != NULL; rr = rr->next)
++    {
++      if (rr->type == T_SRV)
++	{
++	  if (result->host != NULL)
++	    {
++	      /* need more space */
++	      int length;
++	      char *tmp;
++	      length = strlen (result->host) + 1 +
++	               strlen (rr->u.srv->target) + 1 + 5 + 1;
++	      tmp = malloc (length);
++	      if (tmp == NULL)
++	        {
++	          dns_free_data (r);
++		  return PAM_BUF_ERR;
++	        }
++	      sprintf (tmp, "%s %s:%d", result->host, rr->u.srv->target,
++	               rr->u.srv->port);
++	      free (result->host);
++	      result->host = tmp;
++	    }
++	  else
++	    {
++	      /* Server Host */
++	      result->host = strdup (rr->u.srv->target);
++	      if (result->host == NULL)
++	        {
++	          dns_free_data (r);
++		  return PAM_BUF_ERR;
++	        }
++	      /* Port */
++	      result->port = rr->u.srv->port;
++	    }
++
++#ifdef LDAPS_PORT
++	  /* Hack: if the port is the registered SSL port, enable SSL. */
++	  if (result->port == LDAPS_PORT)
++	    {
++	      result->ssl_on = SSL_LDAPS;
++	    }
++#endif /* SSL */
++
++	  /* DN */
++	  stat = _pam_ldap_getdnsdn (_res.defdname, &result->base);
++	  if (stat != PAM_SUCCESS)
++	    {
++	      dns_free_data (r);
++	      return stat;
++	    }
++	}
++    }
++
++  dns_free_data (r);
++  stat = PAM_SUCCESS;
++
++  return stat;
++}
+--- /dev/null	2004-10-19 17:45:17.794252000 -0400
++++ pam_ldap-176/dnsconfig.h	2004-10-28 17:24:13.694936240 -0400
+@@ -0,0 +1,35 @@
++/* Copyright (C) 1997-2001 Luke Howard.
++   This file started off as part of the nss_ldap library.
++   Contributed by Luke Howard, <lukeh@padl.com>, 1997.
++   (The author maintains a non-exclusive licence to distribute this file
++   under their own conditions.)
++
++   The nss_ldap library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Library General Public License as
++   published by the Free Software Foundation; either version 2 of the
++   License, or (at your option) any later version.
++
++   The nss_ldap library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Library General Public License for more details.
++
++   You should have received a copy of the GNU Library General Public
++   License along with the nss_ldap library; see the file COPYING.LIB.  If not,
++   write to the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++   Boston, MA 02111-1307, USA.
++ */
++
++#ifndef _LDAP_PAM_LDAP_DNSCONFIG_H
++#define _LDAP_PAM_LDAP_DNSCONFIG_H
++
++/* utility routines.  */
++
++int _pam_ldap_getdnsdn (
++			char *domain,
++			char **rval);
++
++int _pam_ldap_readconfigfromdns (
++				 pam_ldap_config_t *result);
++
++#endif /* _LDAP_PAM_LDAP_DNSCONFIG_H */
+--- pam_ldap-176/pam_ldap.c	2004-09-30 22:33:14.000000000 -0400
++++ pam_ldap-176/pam_ldap.c	2004-10-28 17:40:56.918423088 -0400
+@@ -130,6 +130,7 @@
+ 
+ #include "pam_ldap.h"
+ #include "md5.h"
++#include "dnsconfig.h"
+ 
+ #if defined(HAVE_SECURITY_PAM_MISC_H) || defined(HAVE_PAM_PAM_MISC_H)
+  /* FIXME: is there something better to check? */
+@@ -1107,11 +1108,15 @@
+     {
+       /* 
+        * According to PAM Documentation, such an error in a config file
+-       * SHOULD be logged at LOG_ALERT level
++       * SHOULD be logged at LOG_ALERT level, but we suppress it if DNS
++       * can provide us with the needed information
+        */
+-      syslog (LOG_ALERT, "pam_ldap: missing \"host\" in file \"%s\"",
+-	      configFile);
+-      return PAM_SERVICE_ERR;
++      if (_pam_ldap_readconfigfromdns (result) != PAM_SUCCESS)
++        {
++          syslog (LOG_ALERT, "pam_ldap: missing \"host\" in file \"%s\"",
++	          configFile);
++          return PAM_SERVICE_ERR;
++        }
+     }
+ 
+ #if !(defined(HAVE_SASL_SASL_H) || defined(HAVE_SASL_H)) && !defined(HAVE_LDAP_SASL_INTERACTIVE_BIND_S)

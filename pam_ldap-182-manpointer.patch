@@ -1,0 +1,14 @@
+Give people a pointer to the pam_ldap man page, because the name of this file
+actually has changed over time.
+
+--- pam_ldap/ldap.conf	2006-07-25 17:16:11.000000000 -0400
++++ pam_ldap/ldap.conf	2006-07-25 17:16:06.000000000 -0400
+@@ -3,6 +3,8 @@
+ # This is the configuration file for the LDAP nameservice
+ # switch library and the LDAP PAM module.
+ #
++# The man page for this file is pam_ldap(5)
++#
+ # PADL Software
+ # http://www.padl.com
+ #

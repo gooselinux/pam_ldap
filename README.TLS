@@ -1,0 +1,7 @@
+Please note that if nss_ldap or pam_ldap are configured to use TLS, that the
+clients will attempt to validate the server's certificate when connecting to
+the server.  This includes comparing the subject's name as stored in the
+certificate to the value of the "host" configuration option in /etc/ldap.conf
+(as usual, the two must exactly match, letter for letter), and validation of
+the signature on the certificate against the list of certifying authorities
+which the client is configured to trust.
